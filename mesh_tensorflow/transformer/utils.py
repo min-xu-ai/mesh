@@ -474,7 +474,6 @@ def tpu_estimator_model_fn(model_type,
                       (transformer.Bitransformer,
                        transformer.StudentTeacher)):
         inputs = mtf_features["inputs"]
-        weights = None
       else:
         raise ValueError("unrecognized class")
       logits, _ = transformer_model.call_simple(
@@ -483,7 +482,7 @@ def tpu_estimator_model_fn(model_type,
           compute_loss=False,
           mode=mode,
           variable_dtype=get_variable_dtype())
-      batch_dim, length_dim, vocab_dim = logits.shape.dims
+      _, length_dim, vocab_dim = logits.shape.dims
       cross_entropy = mtf.layers.softmax_cross_entropy_with_logits(
           logits, mtf_features["targets"], vocab_dim)
       cross_entropy *= mtf.cast(
@@ -1366,6 +1365,7 @@ def get_estimator(model_type, vocabulary, mesh_shape,
                   layout_rules, model_dir, batch_size, sequence_length,
                   autostack, learning_rate_schedule, keep_checkpoint_max,
                   save_checkpoints_steps, optimizer, predict_fn,
+                  score_in_predict_mode,
                   variable_filter, ensemble_inputs, use_tpu, tpu_job_name,
                   iterations_per_loop, cluster, init_checkpoint=None,
                   mesh_devices=None):
@@ -1396,6 +1396,7 @@ def get_estimator(model_type, vocabulary, mesh_shape,
         - features: a dict representing an example. Every value will be an
           mtf.Tensor with shape [batch_dim, length_dim].
         - variable_dtype: an mtf.VariableDType
+    score_in_predict_mode: compute log-likelihood scores instead of predictions
     variable_filter: a string, a variable will only be trained if its name
       matches this regex. If None (default), train all trainable variables.
     ensemble_inputs: an integer, see `train_model` docstring for details.
@@ -1450,6 +1451,7 @@ def get_estimator(model_type, vocabulary, mesh_shape,
       save_checkpoints_steps=save_checkpoints_steps,
       optimizer=optimizer,
       predict_fn=predict_fn,
+      score_in_predict_mode=score_in_predict_mode,
       variable_filter=variable_filter,
       ensemble_inputs=ensemble_inputs,
       init_checkpoint=init_checkpoint,
@@ -1714,7 +1716,8 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
 
 
 def export_model(estimator, export_dir, vocabulary, sequence_length,
-                 batch_size=1, checkpoint_path=None):
+                 model_type, score_in_predict_mode=False, batch_size=1,
+                 checkpoint_path=None):
   """Export a model in TF SavedModel format to be used for inference on CPUs.
 
   Args:
@@ -1725,6 +1728,8 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
     vocabulary: sentencepiece vocab, vocabulary instance to use for encoding.
     sequence_length: an integer or a dict from feature-key to integer
       the (packed) sequence length, e.g. {"inputs": 512, "targets": 128}
+    model_type: a string, set `get_estimator` docstring for details.
+    score_in_predict_mode: compute log-likelihood scores instead of predictions
     batch_size: int, number of sequences per batch. Should match estimator.
     checkpoint_path: str, path to checkpoint. If None (default), use the most
       recent in the model directory.
@@ -1732,7 +1737,6 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
   Returns:
     The string path to the exported directory.
   """
-
   def serving_input_fn():
     """Constructs input portion of Graph in serving.
 
@@ -1741,28 +1745,58 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
     Returns:
       a ServingInputReceiver
     """
-    inputs = tf.placeholder(
-        dtype=tf.string,
-        shape=[None],
-        name="inputs")
 
-    padded_inputs = tf.pad(inputs, [(0, tf.mod(-tf.size(inputs), batch_size))])
+    def str_placeholder(name):
+      return tf.placeholder(dtype=tf.string, shape=[None], name=name)
 
-    dataset = tf.data.Dataset.from_tensor_slices(padded_inputs)
-    dataset = dataset.map(lambda x: {"inputs": x})
-    dataset = transformer_dataset.encode_all_features(dataset, vocabulary)
+    if model_type == "lm" or not score_in_predict_mode:
+      # In this case, users of exported model provide only one feature, which is
+      # "targets" if scoring or "inputs" if doing prediction.
+
+      input_key = "targets" if score_in_predict_mode else "inputs"
+      if score_in_predict_mode:
+        vocab_to_use = targets_vocabulary(vocabulary)
+      else:
+        vocab_to_use = inputs_vocabulary(vocabulary)
+
+      targets = str_placeholder(input_key)
+
+      padded_targets = tf.pad(
+          targets, [(0, tf.mod(-tf.size(targets), batch_size))])
+
+      dataset = tf.data.Dataset.from_tensor_slices(padded_targets)
+      dataset = dataset.map(lambda targ: {input_key: targ})
+      dataset = transformer_dataset.encode_all_features(dataset, vocab_to_use)
+      receiver_tensors = {input_key: targets}
+    elif score_in_predict_mode:
+      # When scoring for encoder-decoder models, both "inputs" and "targets"
+      # must be provided.
+
+      inputs = str_placeholder("inputs")
+      targets = str_placeholder("targets")
+
+      padded_inputs = tf.pad(inputs,
+                             [(0, tf.mod(-tf.size(inputs), batch_size))])
+      padded_targets = tf.pad(targets,
+                              [(0, tf.mod(-tf.size(targets), batch_size))])
+
+      dataset = tf.data.Dataset.from_tensor_slices(
+          (padded_inputs, padded_targets))
+      dataset = dataset.map(lambda inp, targ: {"inputs": inp, "targets": targ})
+      dataset = transformer_dataset.encode_all_features(dataset, vocabulary)
+      receiver_tensors = {"inputs": inputs, "targets": targets}
+
     dataset = transformer_dataset.pack_or_pad(
         dataset=dataset,
         length=sequence_length,
         pack=False,
-        feature_keys=["inputs"]
+        feature_keys=receiver_tensors.keys()
     )
-
     dataset = dataset.batch(batch_size)
 
     features = tf.data.experimental.get_single_element(dataset)
     return tf.estimator.export.ServingInputReceiver(
-        features=features, receiver_tensors=inputs)
+        features=features, receiver_tensors=receiver_tensors)
 
   return estimator.export_saved_model(
       export_dir, serving_input_fn, checkpoint_path=checkpoint_path)
@@ -2010,6 +2044,7 @@ def run(tpu_job_name,
         learning_rate_schedule=None,
         optimizer=None,
         predict_fn=None,
+        score_in_predict_mode=False,
         variable_filter=None,
         perplexity_eval_steps=100,
         init_checkpoint=None,
@@ -2059,6 +2094,7 @@ def run(tpu_job_name,
       such factos to be multiplied together.
     optimizer: a class extending optimize.Optimizer, required for training
     predict_fn: an optional function, see `get_estimator` docstring for details.
+    score_in_predict_mode: compute log-likelihood scores instead of predictions
     variable_filter: a string, see `get_estimator` docstring for details.
     perplexity_eval_steps: an integer - number of steps for perplexity eval
     init_checkpoint: a string, see `get_estimator` docstring for details.
@@ -2123,6 +2159,7 @@ def run(tpu_job_name,
       save_checkpoints_steps=save_checkpoints_steps,
       optimizer=optimizer,
       predict_fn=predict_fn,
+      score_in_predict_mode=score_in_predict_mode,
       variable_filter=variable_filter,
       init_checkpoint=init_checkpoint,
       ensemble_inputs=ensemble_inputs,
@@ -2212,7 +2249,7 @@ def run(tpu_job_name,
       # Use the latest checkpoint in the model directory.
       checkpoint_path = None
     export_model(estimator, export_path, vocabulary, sequence_length,
-                 batch_size, checkpoint_path)
+                 model_type, score_in_predict_mode, batch_size, checkpoint_path)
 
   else:
     raise ValueError(
