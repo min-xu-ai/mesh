@@ -491,11 +491,13 @@ def tpu_estimator_model_fn(model_type,
           compute_loss=False,
           mode=mode,
           variable_dtype=get_variable_dtype())
+      logits = mtf.cast(logits, tf.float32)
       batch_dim, length_dim, vocab_dim = logits.shape.dims
       cross_entropy = mtf.layers.softmax_cross_entropy_with_logits(
           logits, mtf_features["targets"], vocab_dim)
+      # 0=padding and negative targets are a hack to indicate no loss
       cross_entropy *= mtf.cast(
-          mtf.not_equal(targets, 0), cross_entropy.dtype)
+          mtf.greater(targets, 0), cross_entropy.dtype)
       if model_type == "delimited_lm":
         cross_entropy *= mtf.cast(mtf.logical_not(
             transformer.delimited_lm_inputs_mask(targets)), cross_entropy.dtype)
@@ -777,7 +779,8 @@ def tpu_estimator_model_fn(model_type,
       predictions = mtf.cast(mtf.argmax(logits, vocab_dim), targets.dtype)
       anon_predictions = mtf.anonymize(predictions)
       anon_targets = mtf.anonymize(targets)
-      anon_weights = mtf.layers.weights_nonzero(anon_targets, dtype=tf.float32)
+      # 0=padding and negative targets are a hack to indicate no loss
+      anon_weights = mtf.cast(mtf.greater(anon_targets, 0), tf.float32)
       if model_type == "delimited_lm":
         anon_weights *= mtf.cast(
             mtf.logical_not(transformer.delimited_lm_inputs_mask(anon_targets)),
@@ -972,7 +975,8 @@ def encode_inputs(inputs,
                   model_type,
                   batch_size,
                   sequence_length,
-                  eos_id=1):
+                  eos_id=1,
+                  unscored_prefix=None):
   """Encode string inputs for inference/scoring.
 
   Args:
@@ -982,14 +986,18 @@ def encode_inputs(inputs,
     batch_size: an integer
     sequence_length: an integer (maximum decode length)
     eos_id: EOS id
+    unscored_prefix: an optional list of strings
 
   Returns:
     all_input_ids: encoded inputs
   """
   n = len(inputs)
   all_input_ids = []
-  for line in inputs:
+  for line_num, line in enumerate(inputs):
     ids = inputs_vocabulary(vocabulary).encode(line.strip())
+    if unscored_prefix:
+      prefix_str = unscored_prefix[line_num].strip()
+      ids = [-i for i in inputs_vocabulary(vocabulary).encode(prefix_str)] + ids
     if model_type != "lm":
       # for text2self problems, the inputs represent a partial sequence
       # to be continued, and should not be terminated by EOS.
@@ -1211,7 +1219,8 @@ def clean_decodes(ids, eos_id=1, pad_id=0, length_axis=-1):
 
 
 def _score_with_estimator(estimator, input_fn, eval_checkpoint_step, model_dir,
-                          scores_filename, num_examples=None):
+                          score_postprocess_fn, vocabulary,
+                          num_examples=None):
   """For each example returned by input_fn, compute log likelihood.
 
   Args:
@@ -1221,7 +1230,10 @@ def _score_with_estimator(estimator, input_fn, eval_checkpoint_step, model_dir,
     eval_checkpoint_step: int, list of ints, or None, see `eval_model`
       docstring.
     model_dir: string, estimator model_dir
-    scores_filename: a string (path of file to write scores to)
+    score_postprocess_fn: Function that takes in model outputs and
+      post-processes, saves, and returns then.
+    vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
+      targets_vocabulary) tuple
     num_examples: int, the total # of examples being scored, None if unknown
 
   Returns:
@@ -1230,20 +1242,64 @@ def _score_with_estimator(estimator, input_fn, eval_checkpoint_step, model_dir,
   checkpoint_path, = get_checkpoint_iterator(eval_checkpoint_step, model_dir)
 
   result_iter = estimator.predict(input_fn, checkpoint_path=checkpoint_path)
-  scores, targets = [], []
-  for m in result_iter:
-    scores.append(m["scores"])
-    targets.append(m["targets"])
-  # Remove any padding examples
+  # TODO(dei): This code is not well-designed for large-scale scoring, where the
+  # number of examples might exceed available memory.
+  results = list(result_iter)
+
   if num_examples is None:
+    targets = [r["targets"] for r in results]
     num_padded = next((i for i, x in enumerate(targets[::-1]) if x.any()), None)
     num_examples = len(targets) - num_padded
-  scores = scores[:num_examples]
-  targets = targets[:num_examples]
+  results = results[:num_examples]
+
+  return score_postprocess_fn(results, vocabulary)
+
+
+@gin.configurable
+def save_scores(results, vocabulary,
+                scores_filename=None, save_example_text=True):
+  """Processes results from scoring examples and maybe saves them to disk.
+
+  Args:
+    results: list of dictionaries containing the results for each scored
+        example.
+    vocabulary: a function that that returns a tf.data.Dataset with examples
+      containing the string field 'targets' and optionally the field 'inputs'
+    scores_filename: a string (path of file to write scores to). If None, scores
+        are returned but not written to disk.
+    save_example_text: a boolean - If True, then the text for each example is
+        also saved/returned.
+
+  Returns:
+    List of float scores, one score per example. If save_example_text is True,
+    the text of the inputs/targets for each example are also returned.
+  """
+  if not results:
+    raise ValueError("No examples were scored.")
+
+  scores = [r["scores"] for r in results]
+
   if scores_filename is not None:
     write_lines_to_file(["%f" % f for f in scores], scores_filename+".scores")
-    # Targets gets decoded in python then written out later.
-  return scores, targets
+
+  if save_example_text:
+    # Targets will always exist.
+    targets = [r.get("targets_plaintext", r["targets"]) for r in results]
+    targets = _maybe_decode_python(targets, targets_vocabulary(vocabulary))
+    if scores_filename is not None:
+      write_lines_to_file(targets, scores_filename+".targets")
+
+    # Inputs may only exist for some tasks.
+    if "inputs" in results[0]:
+      inputs = [r.get("inputs_plaintext", r["inputs"]) for r in results]
+      inputs = _maybe_decode_python(inputs, inputs_vocabulary(vocabulary))
+      if scores_filename is not None:
+        write_lines_to_file(inputs, scores_filename+".inputs")
+      return scores, inputs, targets
+    else:
+      return scores, targets
+
+  return scores
 
 
 def _maybe_decode_python(ids_or_strs, vocabulary):
@@ -1259,7 +1315,8 @@ def _maybe_decode_python(ids_or_strs, vocabulary):
 def score_from_strings(estimator, vocabulary, model_type, batch_size,
                        sequence_length, model_dir, eval_checkpoint_step,
                        inputs=gin.REQUIRED, targets=gin.REQUIRED,
-                       scores_filename=gin.REQUIRED, eos_id=1, score_eos=True):
+                       score_postprocess_fn=gin.REQUIRED, eos_id=1,
+                       score_eos=True):
   """Compute log likelihoods per example and write to a text file.
 
   inputs & targets must either be the same length (in lines) or have inputs
@@ -1284,7 +1341,8 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
       alternatively, a string filepath for a text file (one string per line)
     targets: a list of strings (targets)
       alternatively, a string filepath for a text file (one string per line)
-    scores_filename: a string (path of file to write)
+    score_postprocess_fn: Function that takes in model outputs and
+      post-processes then returns then.
     eos_id: EOS id
     score_eos: a boolean - whether to score the final eos token of each line
       If this is set to false, the scores can be interpreted as prefix
@@ -1311,12 +1369,19 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
       if len(targets) != 1:
         raise ValueError("Expected only one target string")
       targets = targets * len(inputs)
-  if has_inputs:
-    all_input_ids = encode_inputs(inputs, vocabulary, model_type, batch_size,
-                                  sequence_length["inputs"], eos_id=eos_id)
-  all_target_ids = encode_inputs(
-      targets, vocabulary, model_type, batch_size,
-      sequence_length["targets"], eos_id=eos_id if score_eos else 0)
+  if has_inputs and model_type == "lm":
+    has_inputs = False
+    all_target_ids = encode_inputs(
+        targets, vocabulary, model_type, batch_size,
+        sequence_length["targets"], eos_id=eos_id if score_eos else 0,
+        unscored_prefix=inputs)
+  else:
+    if has_inputs:
+      all_input_ids = encode_inputs(inputs, vocabulary, model_type, batch_size,
+                                    sequence_length["inputs"], eos_id=eos_id)
+    all_target_ids = encode_inputs(
+        targets, vocabulary, model_type, batch_size,
+        sequence_length["targets"], eos_id=eos_id if score_eos else 0)
 
   def input_fn(params):
     del params
@@ -1327,21 +1392,16 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
     dataset = dataset.batch(batch_size, drop_remainder=True)
     return dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
-  scores, targets = _score_with_estimator(
-      estimator, input_fn, eval_checkpoint_step, model_dir, scores_filename,
-      len(targets))
-  targets = _maybe_decode_python(targets, targets_vocabulary(vocabulary))
-  if scores_filename is not None:
-    write_lines_to_file(["%s" % f for f in targets],
-                        scores_filename + ".targets")
-
-  return scores, targets
+  return _score_with_estimator(
+      estimator, input_fn, eval_checkpoint_step, model_dir,
+      score_postprocess_fn, vocabulary, len(targets))
 
 
 @gin.configurable
 def score_from_dataset(estimator, vocabulary, batch_size, sequence_length,
                        model_dir, eval_checkpoint_step, dataset_split,
-                       score_dataset_fn=None, scores_filename=gin.REQUIRED):
+                       score_dataset_fn=None,
+                       score_postprocess_fn=gin.REQUIRED):
   """Compute log likelihoods per example and write to a text file.
 
   The function returns a list of floats representing the log-likelihood of the
@@ -1361,7 +1421,8 @@ def score_from_dataset(estimator, vocabulary, batch_size, sequence_length,
         dataset_split: a string
     score_dataset_fn: A function returning a list of dataset.EvalDataset tuples.
       See `eval_dataset_fn` argument to `eval_model` for details.
-    scores_filename: a string (path of file to write)
+    score_postprocess_fn: Function that takes in model outputs and
+      post-processes then returns then.
 
   Returns:
     scores: a list of floats, the log likelihood scores
@@ -1389,16 +1450,9 @@ def score_from_dataset(estimator, vocabulary, batch_size, sequence_length,
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     return dataset
 
-  scores, targets = _score_with_estimator(
-      estimator, input_fn, eval_checkpoint_step, model_dir, scores_filename,
-      None)
-
-  targets = _maybe_decode_python(targets, targets_vocabulary(vocabulary))
-  if scores_filename is not None:
-    write_lines_to_file(["%s" % f for f in targets],
-                        scores_filename + ".targets")
-
-  return scores, targets
+  return _score_with_estimator(
+      estimator, input_fn, eval_checkpoint_step, model_dir,
+      score_postprocess_fn, vocabulary, None)
 
 
 def get_estimator(model_type, vocabulary, mesh_shape,
@@ -1407,7 +1461,7 @@ def get_estimator(model_type, vocabulary, mesh_shape,
                   save_checkpoints_steps, optimizer, predict_fn,
                   variable_filter, ensemble_inputs, use_tpu, tpu_job_name,
                   iterations_per_loop, cluster, init_checkpoint=None,
-                  mesh_devices=None):
+                  mesh_devices=None, score_in_predict_mode=False):
   """Create TPU estimator for the transfomer Mesh-TF model.
 
   Args:
@@ -1447,6 +1501,8 @@ def get_estimator(model_type, vocabulary, mesh_shape,
       variables that appear both in the current graph and the checkpoint.
     mesh_devices: a list of strings, the device names to use for each mesh
       slice. Only required for GPU.
+    score_in_predict_mode: a bool, compute log-likelihood scores instead of
+      predictions.
   Returns:
     an Estimator object.
   """
@@ -1492,7 +1548,8 @@ def get_estimator(model_type, vocabulary, mesh_shape,
       variable_filter=variable_filter,
       ensemble_inputs=ensemble_inputs,
       init_checkpoint=init_checkpoint,
-      mesh_devices=mesh_devices)
+      mesh_devices=mesh_devices,
+      score_in_predict_mode=score_in_predict_mode)
 
   estimator = tpu_estimator.TPUEstimator(
       model_fn=model_fn,
@@ -1509,7 +1566,7 @@ def get_estimator(model_type, vocabulary, mesh_shape,
 
 def train_model(estimator, vocabulary, sequence_length, batch_size,
                 train_dataset_fn, train_steps, ensemble_inputs,
-                dataset_split="train"):
+                dataset_split="train", skip_seen_data=False):
   """Train a Mesh-TF model.
 
   Args:
@@ -1531,10 +1588,15 @@ def train_model(estimator, vocabulary, sequence_length, batch_size,
       configure Unitransformer.ensemble  to the right size. If None, then all
       models are trained on the same inputs.
     dataset_split: str, which dataset split to train on.
+    skip_seen_data: a boolean, is `False` by default. Used when a training run
+      restarts to skip already seen data. This flag is only consistent when
+      every setting (such as batch size and random seed) on the model is the
+      same between the original run and the new run.
   """
 
   def input_fn(params):
     del params
+
     dataset = train_dataset_fn(
         sequence_length=sequence_length,
         vocabulary=vocabulary,
@@ -1542,6 +1604,14 @@ def train_model(estimator, vocabulary, sequence_length, batch_size,
     dataset = dataset.repeat().batch(
         batch_size * (ensemble_inputs or 1), drop_remainder=True)
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
+    # On the first time data is read in after relaunching, skip data that has
+    # already been seen.
+    if skip_seen_data:
+      recovered_step = estimator.get_variable_value("global_step")
+      if recovered_step > 0:
+        tf.logging.info("Skipping %d steps of data.", recovered_step)
+      dataset = dataset.skip(recovered_step)
     return dataset
 
   estimator.train(input_fn=input_fn, max_steps=train_steps)
@@ -1595,7 +1665,7 @@ def infer_model(estimator,
 
 def eval_model(estimator, vocabulary, sequence_length, batch_size,
                dataset_split, model_dir, eval_dataset_fn, eval_summary_dir,
-               eval_checkpoint_step):
+               eval_checkpoint_step, eval_with_score=False):
   """Eval a Mesh-TF model.
 
   Args:
@@ -1631,6 +1701,8 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
       whose global steps are closest to the global steps provided. If None and
       mode="eval", run eval continuously waiting for new checkpoints via
       `tf.train.checkpoints_iterator`.
+    eval_with_score: bool, whether to evaluate using log likelihood scores of
+      targets instead of decoded predictions.
   """
   if eval_dataset_fn is None:
     raise ValueError("Must provide eval_dataset_fn through gin for eval.")
@@ -1714,17 +1786,25 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
   for checkpoint_path in checkpoint_paths:
     tf.logging.info("Checkpoint path %s" % checkpoint_path)
     global_step = int(get_step_from_checkpoint_path(checkpoint_path))
-    decodes = decode(estimator, input_fn, vocabulary, checkpoint_path)
+    if eval_with_score:
+      outputs, _ = _score_with_estimator(
+          estimator, input_fn, global_step, model_dir, save_scores, vocabulary,
+          num_examples=sum(len(cex) for cex in cached_examples.values()))
+    else:
+      outputs = [
+          tf.compat.as_text(d) for d in
+          decode(estimator, input_fn, vocabulary, checkpoint_path)
+      ]
     for eval_dataset in eval_datasets:
       # Extract the portion of decodes corresponding to this dataset
       examples = cached_examples[eval_dataset.name]
       dataset_size = len(examples)
       predictions = [
-          eval_dataset.postprocess_fn(tf.compat.as_text(d), example=ex)
-          for d, ex in zip(decodes[:dataset_size], examples)
+          eval_dataset.postprocess_fn(d, example=ex)
+          for d, ex in zip(outputs[:dataset_size], examples)
       ]
       # Remove the used decodes.
-      del decodes[:dataset_size]
+      del outputs[:dataset_size]
 
       global_step = int(get_step_from_checkpoint_path(checkpoint_path))
 
@@ -1747,9 +1827,9 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
 
     # Only padding should remain.
     expected_pad = -sum(len(t) for t in cached_targets.values()) % batch_size
-    if len(decodes) != expected_pad:
-      raise ValueError("{} padded decodes, {} expected.".format(
-          len(decodes), expected_pad))
+    if outputs and len(outputs) != expected_pad:
+      raise ValueError("{} padded outputs, {} expected.".format(
+          len(outputs), expected_pad))
 
 
 def export_model(estimator, export_dir, vocabulary, sequence_length,
@@ -2053,7 +2133,8 @@ def run(tpu_job_name,
         perplexity_eval_steps=100,
         init_checkpoint=None,
         ensemble_inputs=None,
-        train_model_fn=train_model):
+        train_model_fn=train_model,
+        skip_seen_data=False):
   """Run training, eval, or inference depending on `mode`.
 
   Args:
@@ -2076,8 +2157,14 @@ def run(tpu_job_name,
     export_checkpoint_step: int or None, see `export_model` doc string for
       details.
     export_path: a string, path to export the saved model
-    mode: string, train/eval/perplexity_eval/infer
-      perplexity_eval computes the perplexity of the dev set.
+    mode: string, one of
+      train - train the model
+      eval - eval the model by decoding predictions
+      score_eval - eval the model by computing log likelihood scores of targets
+      perplexity_eval - eval the model by computing perplexity
+      infer - decode predictions based on inputs
+      score_from_dataset - compute scores of targets from a dataset
+      score_from_strings - compute scores of targets from strings or a file
     iterations_per_loop: integer, steps per train loop
     save_checkpoints_steps: integer, see `get_estimator` docstring.
     keep_checkpoint_max: an integer, see `get_estimator` docstring.
@@ -2103,6 +2190,10 @@ def run(tpu_job_name,
     init_checkpoint: a string, see `get_estimator` docstring for details.
     ensemble_inputs: an integer, see `train_model` docstring for details.
     train_model_fn: an optional train function, is `train_model` by default.
+    skip_seen_data: a boolean, is `False` by default. Used when a training run
+      restarts to skip already seen data. This flag is only consistent when
+      every setting (such as batch size and random seed) on the model is the
+      same between the original run and the new run.
   """
   if isinstance(sequence_length, int):
     sequence_length = {"inputs": sequence_length,
@@ -2169,15 +2260,19 @@ def run(tpu_job_name,
       tpu_job_name=tpu_job_name,
       iterations_per_loop=iterations_per_loop,
       cluster=cluster,
-      mesh_devices=mesh_devices)
+      mesh_devices=mesh_devices,
+      score_in_predict_mode="score" in mode)
 
   if mode == "train":
     # train_dataset_fn could be None if train_model_fn is not equal to
     # train_model
     if train_dataset_fn is None:
       raise ValueError("Must provide train_dataset_fn through gin")
+
     train_model_fn(estimator, vocabulary, sequence_length, batch_size,
-                   train_dataset_fn, train_steps, ensemble_inputs)
+                   train_dataset_fn, train_steps, ensemble_inputs,
+                   skip_seen_data=skip_seen_data)
+
   elif mode == "perplexity_eval":
     if eval_dataset_fn is None:
       if train_dataset_fn is not None:
@@ -2221,10 +2316,10 @@ def run(tpu_job_name,
             steps=perplexity_eval_steps,
             checkpoint_path=checkpoint_path,
             name=name)
-  elif mode == "eval":
+  elif mode in ("eval", "score_eval"):
     eval_model(estimator, vocabulary, sequence_length, batch_size,
                dataset_split, model_dir, eval_dataset_fn, eval_summary_dir,
-               eval_checkpoint_step)
+               eval_checkpoint_step, eval_with_score=(mode == "score_eval"))
   elif mode == "infer":
     infer_model(estimator, vocabulary, sequence_length, batch_size, model_type,
                 model_dir, eval_checkpoint_step)
