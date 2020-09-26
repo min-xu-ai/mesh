@@ -30,7 +30,7 @@ import tensorflow.compat.v1 as tf
 tf.flags.DEFINE_string("data_dir", "/tmp/mnist_data",
                        "Path to directory containing the MNIST dataset")
 tf.flags.DEFINE_string("model_dir", "/tmp/mnist_model", "Estimator model_dir")
-tf.flags.DEFINE_integer("batch_size", 200,
+tf.flags.DEFINE_integer("batch_size", 32*8,
                         "Mini-batch size for the training. Note that this "
                         "is the global batch size and not the per-shard batch.")
 tf.flags.DEFINE_integer("hidden_size", 512, "Size of each hidden layer.")
@@ -40,9 +40,11 @@ tf.flags.DEFINE_integer("epochs_between_evals", 1,
 tf.flags.DEFINE_integer("eval_steps", 0,
                         "Total number of evaluation steps. If `0`, evaluation "
                         "after training is skipped.")
-tf.flags.DEFINE_string("mesh_shape", "b1:2;b2:2", "mesh shape")
-tf.flags.DEFINE_string("layout", "row_blocks:b1;col_blocks:b2",
-                       "layout rules")
+#tf.flags.DEFINE_string("mesh_shape", "b1:2;b2:2", "mesh shape")
+#tf.flags.DEFINE_string("layout", "row_blocks:b1;col_blocks:b2", "layout rules")
+# ddp
+tf.flags.DEFINE_string("mesh_shape", "b1:8", "mesh shape")
+tf.flags.DEFINE_string("layout", "batch:b1", "layout rules")
 
 FLAGS = tf.flags.FLAGS
 
@@ -122,7 +124,11 @@ def model_fn(features, labels, mode, params):
   mesh_shape = mtf.convert_to_shape(FLAGS.mesh_shape)
   layout_rules = mtf.convert_to_layout_rules(FLAGS.layout)
   mesh_size = mesh_shape.size
+  # single gpu
   mesh_devices = [""] * mesh_size
+  # all gpus
+  mesh_devices = ["gpu:%d"%i for i in range(mesh_size)]
+  assert len(mesh_devices) == mesh_size
   mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
       mesh_shape, layout_rules, mesh_devices)
 
@@ -211,7 +217,7 @@ def run_mnist():
     # randomness, while smaller sizes use less memory. MNIST is a small
     # enough dataset that we can easily shuffle the full epoch.
     ds = dataset.train(FLAGS.data_dir)
-    ds_batched = ds.cache().shuffle(buffer_size=50000).batch(FLAGS.batch_size)
+    ds_batched = ds.cache().shuffle(buffer_size=50000).batch(FLAGS.batch_size, drop_remainder=True)
 
     # Iterate through the dataset a set number (`epochs_between_evals`) of times
     # during each training session.
@@ -220,7 +226,7 @@ def run_mnist():
 
   def eval_input_fn():
     return dataset.test(FLAGS.data_dir).batch(
-        FLAGS.batch_size).make_one_shot_iterator().get_next()
+        FLAGS.batch_size, drop_remainder=True).make_one_shot_iterator().get_next()
 
   # Train and evaluate model.
   for _ in range(FLAGS.train_epochs // FLAGS.epochs_between_evals):
