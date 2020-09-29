@@ -420,7 +420,10 @@ class BertModel(object):
         moe_second_policy_train="random",
         moe_second_policy_eval="random",
         moe_second_threshold_train=0.2,
-        moe_second_threshold_eval=0.2)
+        moe_second_threshold_eval=0.2,
+        moe_dropout_rate=0.0,
+        moe_use_experts_attention=False,
+        moe_min_expert_capacity=4)
     layer_output, loss = moe.transformer_moe_layer_v1(
         inputs=x,
         output_dim=self.model_dim,

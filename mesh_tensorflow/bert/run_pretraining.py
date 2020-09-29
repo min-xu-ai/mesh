@@ -165,8 +165,11 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
           ctx.device_assignment,
           logical_to_physical=logical_to_physical)
     else:
+      # XXX minxu: update devices & var_placer
+      mesh_size = mesh_shape.size
+      mesh_devices = ["gpu:%d"%i for i in range(mesh_size)]
       mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
-          mesh_shape, layout_rules, [""] * mesh_shape.size)
+          mesh_shape, layout_rules, mesh_devices)
       var_placer = None
 
     mesh = mtf.Mesh(graph, "bert_mesh", var_placer)
