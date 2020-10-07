@@ -40,12 +40,14 @@ class T2tVocabulary(vocabulary.Vocabulary):
     """
     # Only import tensor2tensor if necessary.
     from tensor2tensor.data_generators import text_encoder   # pylint: disable=g-import-not-at-top
-    from tensor2tensor.data_generators.ops import subword_text_encoder_ops   # pylint: disable=g-import-not-at-top
+    # minxu
+    #from tensor2tensor.data_generators.ops import subword_text_encoder_ops   # pylint: disable=g-import-not-at-top
 
     self._filepath = filepath
     self._subword_text_encoder = text_encoder.SubwordTextEncoder(filepath)
-    self._subword_text_encoder_encode = (
-        subword_text_encoder_ops.subword_text_encoder_encode)
+    # minxu
+    #self._subword_text_encoder_encode = (
+    #    subword_text_encoder_ops.subword_text_encoder_encode)
 
   @property
   def vocab_size(self):
