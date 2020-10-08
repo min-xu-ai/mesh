@@ -1558,6 +1558,7 @@ def get_estimator(model_type, vocabulary, mesh_shape,
       eval_batch_size=batch_size,
       predict_batch_size=batch_size,
       use_tpu=use_tpu,
+      eval_on_tpu=False,  # minxu
       export_to_tpu=False,
       params={})
 
