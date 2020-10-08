@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# cp t2t_data from $HOME to ~/local
+
+# eval run waits for new checkpoint, so you need to ^c it if you don't want that.
 #	--gin_param "run.mode='train'" \
 #	--gin_param "run.mode='perplexity_eval'" \
 
