@@ -5,13 +5,13 @@ import mesh_tensorflow.transformer.t2t_vocabulary
 
 # Dataset
 utils.run.train_dataset_fn = @mesh_tensorflow.transformer.dataset.pretokenized_t2t_dataset
-dataset.pretokenized_t2t_dataset.data_dir = "/private/home/m1n/local/t2t_data"
+dataset.pretokenized_t2t_dataset.data_dir = "/private/home/timdettmers/data/t2t_data"
 dataset.pretokenized_t2t_dataset.dataset_name = "languagemodel_lm1b8k"
 dataset.pretokenized_t2t_dataset.text2self = True
 
 # Vocabulary
 utils.run.vocabulary = @mesh_tensorflow.transformer.t2t_vocabulary.get_t2t_vocabulary()
-t2t_vocabulary.get_t2t_vocabulary.data_dir = "/private/home/m1n/local/t2t_data"
+t2t_vocabulary.get_t2t_vocabulary.data_dir = "/private/home/timdettmers/data/t2t_data"
 t2t_vocabulary.get_t2t_vocabulary.vocabulary_filename = "vocab.languagemodel_lm1b8k.8192.subwords"
 
 # Model

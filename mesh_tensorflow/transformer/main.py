@@ -35,6 +35,8 @@ import os
 import sys
 from mesh_tensorflow.transformer import utils
 import tensorflow.compat.v1 as tf
+#tf.autograph.set_verbosity(1)
+#tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.WARN)
 
 tf.flags.DEFINE_string(
     "tpu_job_name", None,

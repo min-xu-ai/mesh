@@ -42,7 +42,7 @@ Unitransformer.shared_embedding_and_softmax_weights = False
 # Model sizes
 num_layers = 4
 d_model = 512
-d_ff = 65536
+d_ff = 8192
 num_heads = 4
 d_kv = 128
 

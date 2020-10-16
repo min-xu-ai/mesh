@@ -16,6 +16,6 @@ transformer.make_layer_stack.layers = [
 ]
 num_layers = 2
 MoE1D.num_experts = 16
-MoE1D.hidden_size = 4096
-d_ff = 65536
+MoE1D.hidden_size = 256
+d_ff = 4096
 num_heads = 4

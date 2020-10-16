@@ -1,7 +1,10 @@
 # -*-Python-*-
 
-utils.run.layout_rules = "batch:8"
-utils.run.mesh_shape = "all:8"
+utils.run.layout_rules = "batch:8" #use this for 4k and 8k
+#utils.run.layout_rules = "batch:batch,d_ff:model,heads:model,vocab:model"
+#utils.run.layout_rules = "model:8,batch:8" # use this for 64k transformer
+#utils.run.layout_rules = "batch:all;expert:all" # use this for 64k moe
+utils.run.mesh_shape = "model:4,batch:8"
 utils.run.mesh_devices = ['gpu:0', 'gpu:1', 'gpu:2', 'gpu:3', 'gpu:4', 'gpu:5', 'gpu:6', 'gpu:7']
 
 # This is likely a CPU, which can not handle bfloat16 activations.
